@@ -1,0 +1,2 @@
+
+Deno.core.print("test");
