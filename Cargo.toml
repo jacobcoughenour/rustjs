@@ -6,16 +6,21 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-
-
 # linear algrebra library
 glam = "0.20"
 # rend3 rendering
 rend3 = "0.3"
 rend3-routine = "0.3"
 rend3-framework = "0.3"
+rend3-egui = "0.3"
 # cross-platform window creation library
 winit = "0.26"
+# gui library
+egui = "0.16"
+# Backend-agnostic interface for writing apps using egui
+epi = "0.16"
+# Winit integration with egui
+egui_winit_platform = "0.13"
 
 # deno javascript runtime
 deno_core = "0.131"
@@ -23,7 +28,6 @@ deno_core = "0.131"
 tokio = { version = "1.17", features = ["full"] }
 # cli argument parser
 clap = { version = "3.1.11", features = ["derive"] }
-
 
 [[bin]]
 name = "opal"

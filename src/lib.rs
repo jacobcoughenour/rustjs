@@ -1,16 +1,22 @@
+use std::sync::Arc;
+use std::time::Instant;
+
 use glam::{EulerRot, Mat4, UVec2, Vec3, Vec4};
+use winit::event::WindowEvent as WinitWindowEvent;
+use winit::event::{ElementState, VirtualKeyCode};
 use winit::event_loop::ControlFlow;
 use winit::window::{Window, WindowBuilder};
 
-use std::sync::Arc;
-
+use egui_winit_platform::{Platform, PlatformDescriptor};
 use rend3::graph::RenderGraph;
 use rend3::types::{
-	Camera, CameraProjection, DirectionalLight, DirectionalLightHandle, Handedness, Material, Mesh,
+	Camera, CameraProjection, DirectionalLight, DirectionalLightHandle, Handedness, Mesh,
 	MeshBuilder, Object, ObjectHandle, ObjectMeshKind, SampleCount, Surface, TextureFormat,
 };
 use rend3::util::output::OutputFrame;
+use rend3::util::typedefs::FastHashMap;
 use rend3::Renderer;
+use rend3_egui::EguiRenderRoutine;
 use rend3_framework::{DefaultRoutines, Event};
 use rend3_routine::base::BaseRenderGraph;
 use rend3_routine::pbr::{AlbedoComponent, PbrMaterial};
@@ -68,13 +74,37 @@ fn create_mesh() -> Mesh {
 		.unwrap()
 }
 
-#[derive(Default)]
+struct OpalAppRenderState {
+	// scene handles
+	object: ObjectHandle,
+	directional_light: DirectionalLightHandle,
+	camera_data: Camera,
+
+	// egui
+	egui_routine: EguiRenderRoutine,
+	egui_platform: Platform,
+
+	// rendering
+	last_frame_time: Instant,
+	start_time: Instant,
+}
+
 struct OpalApp {
-	object_handle: Option<ObjectHandle>,
-	directional_light_handle: Option<DirectionalLightHandle>,
+	render_state: Option<OpalAppRenderState>,
+	// input
+	keyboard_input_status: FastHashMap<u32, bool>,
 }
 
 const SAMPLE_COUNT: SampleCount = SampleCount::One;
+
+impl OpalApp {
+	pub fn new() -> Self {
+		Self {
+			render_state: None,
+			keyboard_input_status: FastHashMap::default(),
+		}
+	}
+}
 
 impl rend3_framework::App for OpalApp {
 	const HANDEDNESS: Handedness = Handedness::Left;
@@ -91,45 +121,69 @@ impl rend3_framework::App for OpalApp {
 		routines: &Arc<DefaultRoutines>,
 		surface_format: TextureFormat,
 	) {
-		// create a cube mesh
-		let mesh = create_mesh();
-		let mesh_handle = renderer.add_mesh(mesh);
+		let window_size = window.inner_size();
 
-		// create a material
-		let material = PbrMaterial {
-			albedo: AlbedoComponent::Value(Vec4::new(0.0, 0.5, 0.5, 1.0)),
-			..PbrMaterial::default()
-		};
-		let material_handle = renderer.add_material(material);
+		// setup egui
+		let egui_routine = EguiRenderRoutine::new(
+			renderer,
+			surface_format,
+			SAMPLE_COUNT,
+			window_size.width,
+			window_size.height,
+			window.scale_factor() as f32,
+		);
 
-		// bring it all together into a mesh object
+		// integrate with winit
+		let egui_platform = Platform::new(PlatformDescriptor {
+			physical_width: window_size.width as u32,
+			physical_height: window_size.height as u32,
+			scale_factor: window.scale_factor(),
+			font_definitions: egui::FontDefinitions::default(),
+			style: Default::default(),
+		});
+
+		// create a cube
 		let object = Object {
-			mesh_kind: ObjectMeshKind::Static(mesh_handle),
-			material: material_handle,
+			mesh_kind: ObjectMeshKind::Static(renderer.add_mesh(create_mesh())),
+			material: renderer.add_material(PbrMaterial {
+				albedo: AlbedoComponent::Value(Vec4::new(0.0, 0.5, 0.5, 1.0)),
+				..PbrMaterial::default()
+			}),
 			transform: Mat4::IDENTITY,
 		};
 
 		// add the mesh object to the scene and keep the handle for it.
-		self.object_handle = Some(renderer.add_object(object));
+		let object = renderer.add_object(object);
 
+		// setup camera
 		let view_pos = Vec3::new(3.0, 3.0, -5.0);
 		let view =
 			Mat4::from_euler(EulerRot::XYZ, -0.55, 0.5, 0.0) * Mat4::from_translation(-view_pos);
-
-		renderer.set_camera_data(Camera {
+		let camera_data = Camera {
 			projection: CameraProjection::Perspective {
 				vfov: 60.0,
 				near: 0.1,
 			},
 			view,
-		});
+		};
+		renderer.set_camera_data(camera_data);
 
-		self.directional_light_handle = Some(renderer.add_directional_light(DirectionalLight {
+		let directional_light = renderer.add_directional_light(DirectionalLight {
 			color: Vec3::ONE,
 			intensity: 10.0,
 			direction: Vec3::new(-1.0, -4.0, 2.0),
 			distance: 400.0,
-		}));
+		});
+
+		self.render_state = Some(OpalAppRenderState {
+			object,
+			directional_light,
+			camera_data,
+			egui_routine,
+			egui_platform,
+			last_frame_time: Instant::now(),
+			start_time: Instant::now(),
+		});
 	}
 
 	/// The main app window event handler
@@ -144,22 +198,81 @@ impl rend3_framework::App for OpalApp {
 		event: Event<'_, ()>,
 		control_flow: impl FnOnce(ControlFlow),
 	) {
+		// get the render state object
+		let render_state = self.render_state.as_mut().unwrap();
+
+		// pass winit events to egui platform integration
+		render_state.egui_platform.handle_event(&event);
+
 		match event {
 			// OS events
-			Event::WindowEvent {
-				// window close button clicked
-				event: winit::event::WindowEvent::CloseRequested,
-				..
-			} => {
-				control_flow(ControlFlow::Exit);
-			}
+			Event::WindowEvent { event, .. } => match event {
+				// close window button clicked
+				WinitWindowEvent::CloseRequested => {
+					control_flow(ControlFlow::Exit);
+				}
+				// keyboard input
+				WinitWindowEvent::KeyboardInput { input, .. } => {
+					// key pressed
+					if input.state == ElementState::Pressed {
+						// esc key quits
+						if input.virtual_keycode == Some(VirtualKeyCode::Escape) {
+							control_flow(ControlFlow::Exit);
+						}
 
+						if input.virtual_keycode == Some(VirtualKeyCode::W) {
+							render_state.camera_data.view = render_state.camera_data.view
+								* Mat4::from_translation(Vec3::new(0.0, 0.0, -0.1));
+
+							renderer.set_camera_data(render_state.camera_data.clone());
+						}
+					}
+				}
+				WinitWindowEvent::Resized(size) => {
+					render_state.egui_routine.resize(
+						size.width,
+						size.height,
+						window.scale_factor() as f32,
+					);
+				}
+				_ => {}
+			},
+
+			// logic loop
 			Event::MainEventsCleared => {
+				// get frame time
+				let now = Instant::now();
+				let delta = now - render_state.last_frame_time;
+
+				render_state.last_frame_time = now;
+
+				// request a redraw of the scene
 				window.request_redraw();
 			}
 
-			// render
+			// render loop
 			Event::RedrawRequested(_) => {
+				render_state
+					.egui_platform
+					.update_time(render_state.start_time.elapsed().as_secs_f64());
+				render_state.egui_platform.begin_frame();
+
+				let ctx = render_state.egui_platform.context();
+				egui::Window::new("test").resizable(true).show(&ctx, |ui| {
+					ui.label("hello world");
+				});
+
+				let (_output, paint_commands) = render_state.egui_platform.end_frame(Some(window));
+				let paint_jobs = render_state
+					.egui_platform
+					.context()
+					.tessellate(paint_commands);
+
+				let input = rend3_egui::Input {
+					clipped_meshes: &paint_jobs,
+					context: render_state.egui_platform.context(),
+				};
+
 				let frame = OutputFrame::Surface {
 					surface: Arc::clone(surface.unwrap()),
 				};
@@ -185,7 +298,14 @@ impl rend3_framework::App for OpalApp {
 					// Vec4::new(0.1, 0.05, 0.1, 1.0),
 				);
 
+				let surface = graph.add_surface_texture();
+				render_state
+					.egui_routine
+					.add_to_graph(&mut graph, input, surface);
+
 				graph.execute(renderer, frame, cmd_bufs, &ready);
+
+				control_flow(ControlFlow::Poll);
 			}
 
 			// ignore the rest
@@ -195,6 +315,6 @@ impl rend3_framework::App for OpalApp {
 }
 
 pub fn main() {
-	let app = OpalApp::default();
+	let app = OpalApp::new();
 	rend3_framework::start(app, WindowBuilder::new().with_title("Opal Test"));
 }
