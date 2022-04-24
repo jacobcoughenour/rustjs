@@ -1,11 +1,30 @@
 [package]
-name = "rustjs"
+name = "opal"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-deno_core = "0.130"
+
+
+# linear algrebra library
+glam = "0.20"
+# rend3 rendering
+rend3 = "0.3"
+rend3-routine = "0.3"
+rend3-framework = "0.3"
+# cross-platform window creation library
+winit = "0.26"
+
+# deno javascript runtime
+deno_core = "0.131"
+# async i/o runtime
 tokio = { version = "1.17", features = ["full"] }
+# cli argument parser
 clap = { version = "3.1.11", features = ["derive"] }
+
+
+[[bin]]
+name = "opal"
+path = "src/main.rs"
