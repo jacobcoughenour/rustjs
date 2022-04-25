@@ -1,9 +1,13 @@
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
-use glam::{EulerRot, Mat4, UVec2, Vec3, Vec4};
+use glam::{DVec2, EulerRot, Mat3A, Mat4, UVec2, Vec3, Vec3A, Vec4};
+use winit::event::DeviceEvent;
 use winit::event::WindowEvent as WinitWindowEvent;
-use winit::event::{ElementState, VirtualKeyCode};
+use winit::event::{ElementState, ScanCode, VirtualKeyCode};
 use winit::event_loop::ControlFlow;
 use winit::window::{Window, WindowBuilder};
 
@@ -20,6 +24,8 @@ use rend3_egui::EguiRenderRoutine;
 use rend3_framework::{DefaultRoutines, Event};
 use rend3_routine::base::BaseRenderGraph;
 use rend3_routine::pbr::{AlbedoComponent, PbrMaterial};
+
+use histogram::Histogram;
 
 fn vertex(pos: [f32; 3]) -> Vec3 {
 	return Vec3::from(pos);
@@ -74,11 +80,23 @@ fn create_mesh() -> Mesh {
 		.unwrap()
 }
 
+#[derive(Default)]
+struct OpalAppRenderStats {
+	frame_count: u64,
+	sample_duration: f32,
+	min_frame_time: f32,
+	max_frame_time: f32,
+	avg_frame_time: f32,
+}
+
 struct OpalAppRenderState {
 	// scene handles
 	object: ObjectHandle,
 	directional_light: DirectionalLightHandle,
-	camera_data: Camera,
+
+	camera_pos: Vec3A,
+	camera_pitch: f32,
+	camera_yaw: f32,
 
 	// egui
 	egui_routine: EguiRenderRoutine,
@@ -87,22 +105,132 @@ struct OpalAppRenderState {
 	// rendering
 	last_frame_time: Instant,
 	start_time: Instant,
+	last_capture_time: Instant,
+	frame_times: Histogram,
+	stats: OpalAppRenderStats,
+
+	input: OpalAppInputManager,
+}
+
+#[derive(Default, Clone)]
+struct OpalAppInputState {
+	keyboard_scancode_state: FastHashMap<ScanCode, bool>,
+	keyboard_keycode_state: FastHashMap<VirtualKeyCode, bool>,
+	mouse_delta: DVec2,
+}
+
+#[derive(Default, Clone)]
+struct OpalAppInputManager {
+	input_state: OpalAppInputState,
+	prev_input_state: OpalAppInputState,
+}
+
+impl OpalAppInputManager {
+	pub fn push_state(&mut self) {
+		self.prev_input_state = self.input_state.clone();
+	}
+
+	pub fn handle_event<T>(&mut self, event: &Event<T>) {
+		match event {
+			Event::WindowEvent {
+				event: WinitWindowEvent::KeyboardInput { input, .. },
+				..
+			} => {
+				self.input_state.keyboard_scancode_state.insert(
+					input.scancode,
+					match input.state {
+						ElementState::Pressed => true,
+						ElementState::Released => false,
+					},
+				);
+				if input.virtual_keycode.is_some() {
+					self.input_state.keyboard_keycode_state.insert(
+						input.virtual_keycode.unwrap(),
+						match input.state {
+							ElementState::Pressed => true,
+							ElementState::Released => false,
+						},
+					);
+				}
+			}
+			Event::DeviceEvent {
+				event: DeviceEvent::MouseMotion {
+					delta: (delta_x, delta_y),
+					..
+				},
+				..
+			} => {
+				self.input_state.mouse_delta = DVec2::new(*delta_x, *delta_y);
+			}
+			_ => {}
+		}
+	}
+
+	#[inline]
+	fn is_pressed<K, H: BuildHasher>(map: &HashMap<K, bool, H>, code: &K) -> bool
+	where
+		K: Eq + core::hash::Hash,
+	{
+		map.get(code).map_or(false, |v| *v)
+	}
+
+	#[inline]
+	fn is_just_pressed<K, H: BuildHasher>(
+		prev_map: &HashMap<K, bool, H>,
+		map: &HashMap<K, bool, H>,
+		code: &K,
+	) -> bool
+	where
+		K: Eq + core::hash::Hash,
+	{
+		Self::is_pressed(map, code) && !Self::is_pressed(prev_map, code)
+	}
+
+	#[inline]
+	fn is_just_released<K, H: BuildHasher>(
+		prev_map: &HashMap<K, bool, H>,
+		map: &HashMap<K, bool, H>,
+		code: &K,
+	) -> bool
+	where
+		K: Eq + core::hash::Hash,
+	{
+		Self::is_just_pressed(map, prev_map, code)
+	}
+
+	#[inline]
+	pub fn is_keycode_down(&mut self, code: &VirtualKeyCode) -> bool {
+		Self::is_pressed(&self.input_state.keyboard_keycode_state, code)
+	}
+
+	#[inline]
+	pub fn is_keycode_just_pressed(&mut self, code: &VirtualKeyCode) -> bool {
+		Self::is_just_pressed(
+			&self.prev_input_state.keyboard_keycode_state,
+			&self.input_state.keyboard_keycode_state,
+			code,
+		)
+	}
+
+	#[inline]
+	pub fn is_keycode_just_released(&mut self, code: &VirtualKeyCode) -> bool {
+		Self::is_just_released(
+			&self.prev_input_state.keyboard_keycode_state,
+			&self.input_state.keyboard_keycode_state,
+			code,
+		)
+	}
 }
 
 struct OpalApp {
 	render_state: Option<OpalAppRenderState>,
-	// input
-	keyboard_input_status: FastHashMap<u32, bool>,
 }
 
 const SAMPLE_COUNT: SampleCount = SampleCount::One;
 
 impl OpalApp {
 	pub fn new() -> Self {
-		Self {
-			render_state: None,
-			keyboard_input_status: FastHashMap::default(),
-		}
+		Self { render_state: None }
 	}
 }
 
@@ -155,19 +283,6 @@ impl rend3_framework::App for OpalApp {
 		// add the mesh object to the scene and keep the handle for it.
 		let object = renderer.add_object(object);
 
-		// setup camera
-		let view_pos = Vec3::new(3.0, 3.0, -5.0);
-		let view =
-			Mat4::from_euler(EulerRot::XYZ, -0.55, 0.5, 0.0) * Mat4::from_translation(-view_pos);
-		let camera_data = Camera {
-			projection: CameraProjection::Perspective {
-				vfov: 60.0,
-				near: 0.1,
-			},
-			view,
-		};
-		renderer.set_camera_data(camera_data);
-
 		let directional_light = renderer.add_directional_light(DirectionalLight {
 			color: Vec3::ONE,
 			intensity: 10.0,
@@ -178,11 +293,17 @@ impl rend3_framework::App for OpalApp {
 		self.render_state = Some(OpalAppRenderState {
 			object,
 			directional_light,
-			camera_data,
+			camera_pos: Vec3A::new(3.0, 3.0, -5.0),
+			camera_pitch: 0.55,
+			camera_yaw: -0.5,
 			egui_routine,
 			egui_platform,
 			last_frame_time: Instant::now(),
 			start_time: Instant::now(),
+			last_capture_time: Instant::now(),
+			frame_times: Histogram::new(),
+			stats: OpalAppRenderStats::default(),
+			input: OpalAppInputManager::default(),
 		});
 	}
 
@@ -204,29 +325,15 @@ impl rend3_framework::App for OpalApp {
 		// pass winit events to egui platform integration
 		render_state.egui_platform.handle_event(&event);
 
+		// pass events to input manager
+		render_state.input.handle_event(&event);
+
 		match event {
 			// OS events
 			Event::WindowEvent { event, .. } => match event {
 				// close window button clicked
 				WinitWindowEvent::CloseRequested => {
 					control_flow(ControlFlow::Exit);
-				}
-				// keyboard input
-				WinitWindowEvent::KeyboardInput { input, .. } => {
-					// key pressed
-					if input.state == ElementState::Pressed {
-						// esc key quits
-						if input.virtual_keycode == Some(VirtualKeyCode::Escape) {
-							control_flow(ControlFlow::Exit);
-						}
-
-						if input.virtual_keycode == Some(VirtualKeyCode::W) {
-							render_state.camera_data.view = render_state.camera_data.view
-								* Mat4::from_translation(Vec3::new(0.0, 0.0, -0.1));
-
-							renderer.set_camera_data(render_state.camera_data.clone());
-						}
-					}
 				}
 				WinitWindowEvent::Resized(size) => {
 					render_state.egui_routine.resize(
@@ -237,17 +344,81 @@ impl rend3_framework::App for OpalApp {
 				}
 				_ => {}
 			},
-
 			// logic loop
 			Event::MainEventsCleared => {
 				// get frame time
 				let now = Instant::now();
-				let delta = now - render_state.last_frame_time;
+				let delta_time = now - render_state.last_frame_time;
+
+				render_state
+					.frame_times
+					.increment(delta_time.as_micros() as u64)
+					.unwrap();
+
+				let time_since_last_second = now - render_state.last_capture_time;
+				if time_since_last_second > Duration::from_secs(1) {
+					// capture stats
+					render_state.stats = OpalAppRenderStats {
+						frame_count: render_state.frame_times.entries(),
+						sample_duration: time_since_last_second.as_secs_f32(),
+						min_frame_time: render_state.frame_times.minimum().unwrap() as f32 / 1000.0,
+						max_frame_time: render_state.frame_times.maximum().unwrap() as f32 / 1000.0,
+						avg_frame_time: render_state.frame_times.mean().unwrap() as f32 / 1000.0,
+					};
+					render_state.last_capture_time = now;
+					render_state.frame_times.clear();
+				}
 
 				render_state.last_frame_time = now;
 
+				if (render_state
+					.input
+					.is_keycode_just_pressed(&VirtualKeyCode::Escape))
+				{
+					control_flow(ControlFlow::Exit);
+					return;
+				}
+
+				let rotation = Mat3A::from_euler(
+					glam::EulerRot::XYZ,
+					-render_state.camera_pitch,
+					-render_state.camera_yaw,
+					0.0,
+				)
+				.transpose();
+				let forward = -rotation.z_axis;
+				let up = rotation.y_axis;
+				let side = -rotation.x_axis;
+
+				let velocity = 10.0 * delta_time.as_secs_f32();
+
+				if render_state.input.is_keycode_down(&VirtualKeyCode::W) {
+					render_state.camera_pos -= forward * velocity;
+				}
+				if render_state.input.is_keycode_down(&VirtualKeyCode::S) {
+					render_state.camera_pos += forward * velocity;
+				}
+				if render_state.input.is_keycode_down(&VirtualKeyCode::A) {
+					render_state.camera_pos += side * velocity;
+				}
+				if render_state.input.is_keycode_down(&VirtualKeyCode::D) {
+					render_state.camera_pos -= side * velocity;
+				}
+
+				if render_state.input.is_keycode_down(&VirtualKeyCode::E) {
+					// render_state.camera_pos += up * velocity;
+					render_state.camera_pos += Vec3A::new(0.0, velocity, 0.0);
+				}
+				if render_state.input.is_keycode_down(&VirtualKeyCode::C) {
+					// render_state.camera_pos -= up * velocity;
+					render_state.camera_pos -= Vec3A::new(0.0, velocity, 0.0);
+				}
+
 				// request a redraw of the scene
 				window.request_redraw();
+
+				// reset input manager for next frame
+				render_state.input.push_state();
 			}
 
 			// render loop
@@ -258,8 +429,33 @@ impl rend3_framework::App for OpalApp {
 				render_state.egui_platform.begin_frame();
 
 				let ctx = render_state.egui_platform.context();
-				egui::Window::new("test").resizable(true).show(&ctx, |ui| {
-					ui.label("hello world");
+				egui::Window::new("stats").resizable(true).show(&ctx, |ui| {
+					ui.label(format!(
+						"{:0>5} frames over {:0>5.2}s.",
+						render_state.stats.frame_count, render_state.stats.sample_duration
+					));
+					egui::Grid::new("my_grid")
+						.num_columns(2)
+						.spacing([40.0, 4.0])
+						.striped(true)
+						.show(ui, |ui| {
+							ui.label("avg");
+							ui.label(format!("{:0>5.2}ms", render_state.stats.avg_frame_time));
+							ui.end_row();
+							ui.label("min");
+							ui.label(format!("{:0>5.2}ms", render_state.stats.min_frame_time));
+							ui.end_row();
+							ui.label("max");
+							ui.label(format!("{:0>5.2}ms", render_state.stats.max_frame_time));
+							ui.end_row();
+							ui.label("pos");
+							ui.label(format!(
+								"x{:0>5.2} y{:0>5.2} z{:0>5.2}",
+								render_state.camera_pos.x,
+								render_state.camera_pos.y,
+								render_state.camera_pos.z
+							));
+						});
 				});
 
 				let (_output, paint_commands) = render_state.egui_platform.end_frame(Some(window));
@@ -276,6 +472,22 @@ impl rend3_framework::App for OpalApp {
 				let frame = OutputFrame::Surface {
 					surface: Arc::clone(surface.unwrap()),
 				};
+
+				let view = Mat4::from_euler(
+					glam::EulerRot::XYZ,
+					-render_state.camera_pitch,
+					-render_state.camera_yaw,
+					0.0,
+				);
+				let view = view * Mat4::from_translation((-render_state.camera_pos).into());
+
+				renderer.set_camera_data(Camera {
+					projection: CameraProjection::Perspective {
+						vfov: 60.0,
+						near: 0.1,
+					},
+					view,
+				});
 
 				let (cmd_bufs, ready) = renderer.ready();
 

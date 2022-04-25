@@ -29,6 +29,8 @@ tokio = { version = "1.17", features = ["full"] }
 # cli argument parser
 clap = { version = "3.1.11", features = ["derive"] }
 
+histogram = "0.6.9"
+
 [[bin]]
 name = "opal"
 path = "src/main.rs"

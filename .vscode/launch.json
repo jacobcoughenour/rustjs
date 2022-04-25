@@ -5,15 +5,13 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
-			"name": "(Windows) Launch",
 			"type": "cppvsdbg",
 			"request": "launch",
-			"program": "${workspaceRoot}/target/debug/opal.exe",
-			// "args": ["--filename", "src/test.js"],
-			"stopAtEntry": false,
+			"name": "run opal",
+			"program": "${workspaceFolder}\\target\\debug\\opal.exe",
+			"args": [],
 			"cwd": "${workspaceFolder}",
-			"environment": [],
-			"console": "integratedTerminal",
+			"sourceFileMap": {},
 			"preLaunchTask": "Rust: cargo build - opal"
 		}
 	]
